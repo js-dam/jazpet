@@ -1,0 +1,515 @@
+---
+title: "JAZPET-RC"
+author: "Jan S. Dam"
+date: "September 19, 2026"
+toc: false
+number-sections: false
+highlight-style: pygments
+format: 
+  pdf:
+    papersize: A4 
+    geometry: 
+      - top=10mm
+      - bottom=15mm
+      - left=20mm
+    include-in-header:
+      text: |
+        \usepackage{sectsty}
+        \sectionfont{\large}
+        \subsectionfont{\normalsize}
+        \subsubsectionfont{\small}
+  html: 
+    code-fold: true
+  docx: default
+---
+
+```{julia}
+#| label: setup
+#| echo: false
+#| output: false
+
+using DICOM
+using DataFrames
+using Plots
+using CSV
+using Glob
+using Statistics
+using Printf
+
+# --- FIX: Force GR backend to output PNGs for Quarto/IJulia ---
+gr(fmt=:png)
+# -------------------------------------------------------------
+
+# --- CONFIGURATION ---
+folder = "scanner_name/"
+sr = "series_name" 
+DICOM_DIR = joinpath(folder, sr)
+mkpath(sr)
+
+MEAS_ACT_SPH = 27.40e3       # kBq/mL
+MEAS_ACT_BCK = 28.04e6/9575  # kBq/ml
+SCAN_TIME_DIFF = 44          # min
+HALF_LIFE = 109.7            # min (F-18)
+
+TRUE_ACT_SPH = MEAS_ACT_SPH * 0.5^(SCAN_TIME_DIFF / HALF_LIFE)
+TRUE_ACT_BCK = MEAS_ACT_BCK * 0.5^(SCAN_TIME_DIFF / HALF_LIFE)
+DIAMETERS = [10.0, 13.0, 17.0, 22.0, 28.0, 37.0]
+
+MANUAL_OFFSETS_MAP = Dict(
+    10.0 => (1.0, 0.0, 1.0),
+    13.0 => (1.0, 0.0, 1.0),
+    17.0 => (-1.0, 0.0, 2.0),
+    22.0 => (0.0, 0.0, -3.0),
+    28.0 => (0.0, 0.0, 4.0),
+    37.0 => (3.0, 3.0, 4.0)
+)
+```
+
+# Series: `{julia} sr` 
+This report documents the quality control analysis for the dataset using the NEMA/EARL phantom. The analysis includes geometric verification, Maximum Intensity Projections (MIPs) for alignment checks, intensity profile analysis, and quantitative recovery coefficient (RC) calculations.
+
+```{julia}
+#| label: load-and-process
+#| echo: false
+#| output: false
+
+function load_dicom_volume(directory)
+    file_list = glob("*.dcm", directory)
+    if isempty(file_list)
+        file_list = filter(f -> isfile(f), readdir(directory, join=true))
+    end
+    
+    dcm_data = [dcm_parse(f) for f in file_list]
+    
+    # Sort by ImagePositionPatient Z coordinate
+    sort!(dcm_data, by = d -> Float64(d[(0x0020, 0x0032)][3]))
+    
+    dcm_first = dcm_data[1]
+    ps = dcm_first[(0x0028, 0x0030)] # PixelSpacing
+    
+    if length(dcm_data) > 1
+        dz = abs(Float64(dcm_data[2][(0x0020, 0x0032)][3]) - Float64(dcm_data[1][(0x0020, 0x0032)][3]))
+    else
+        dz = Float64(dcm_first[(0x0028, 0x0030)][1]) # Fallback
+    end
+    
+    voxel_size = (Float64(ps[1]), Float64(ps[2]), dz)
+    rows = Int(dcm_first[(0x0028, 0x0010)])
+    cols = Int(dcm_first[(0x0028, 0x0011)])
+    
+    img = zeros(Float64, rows, cols, length(dcm_data))
+    for (i, d) in enumerate(dcm_data)
+        slope = Float64(get(d, (0x0028, 0x1053), 1.0))
+        intercept = Float64(get(d, (0x0028, 0x1052), 0.0))
+        raw_pixels = Float64.(d[tag"PixelData"])
+        img[:, :, i] = permutedims((raw_pixels .* slope) .+ intercept)
+    end
+    
+    return img, voxel_size
+end
+
+function create_sphere_mask(img_shape, center, radius_mm, voxel_size)
+    mask = zeros(Bool, img_shape...)
+    c_px = center ./ voxel_size
+    r_px = radius_mm ./ voxel_size
+    
+    x_min = max(1, floor(Int, c_px[1] - r_px[1]))
+    x_max = min(img_shape[1], ceil(Int, c_px[1] + r_px[1] + 2))
+    y_min = max(1, floor(Int, c_px[2] - r_px[2]))
+    y_max = min(img_shape[2], ceil(Int, c_px[2] + r_px[2] + 2))
+    z_min = max(1, floor(Int, c_px[3] - r_px[3]))
+    z_max = min(img_shape[3], ceil(Int, c_px[3] + r_px[3] + 2))
+    
+    for z in z_min:z_max
+        dz2 = ((z - 0.5) * voxel_size[3] - center[3])^2
+        dz2 > radius_mm^2 && continue
+        for y in y_min:y_max
+            dy2 = ((y - 0.5) * voxel_size[2] - center[2])^2
+            dy2 + dz2 > radius_mm^2 && continue
+            for x in x_min:x_max
+                dx2 = ((x - 0.5) * voxel_size[1] - center[1])^2
+                if dx2 + dy2 + dz2 <= radius_mm^2
+                    mask[x, y, z] = true
+                end
+            end
+        end
+    end
+    return mask
+end
+
+function center_of_mass(crop)
+    tot = sum(crop)
+    tot == 0 && return size(crop) ./ 2.0
+    cx = sum(x * crop[x, y, z] for x in 1:size(crop, 1), y in 1:size(crop, 2), z in 1:size(crop, 3)) / tot
+    cy = sum(y * crop[x, y, z] for x in 1:size(crop, 1), y in 1:size(crop, 2), z in 1:size(crop, 3)) / tot
+    cz = sum(z * crop[x, y, z] for x in 1:size(crop, 1), y in 1:size(crop, 2), z in 1:size(crop, 3)) / tot
+    return (cx, cy, cz)
+end
+
+function auto_find_centers(image, voxel_size)
+    temp = copy(image)
+    temp[temp .< 0.1 * maximum(temp)] .= 0.0
+    
+    centers = Tuple{Float64, Float64, Float64}[]
+    r_px = [round(Int, 20.0 / v) for v in voxel_size]
+    
+    for _ in 1:6
+        idx = argmax(temp)
+        idx_tup = Tuple(idx)
+        
+        sl_x = max(1, idx_tup[1] - r_px[1]):min(size(temp, 1), idx_tup[1] + r_px[1])
+        sl_y = max(1, idx_tup[2] - r_px[2]):min(size(temp, 2), idx_tup[2] + r_px[2])
+        sl_z = max(1, idx_tup[3] - r_px[3]):min(size(temp, 3), idx_tup[3] + r_px[3])
+        
+        crop = temp[sl_x, sl_y, sl_z]
+        if sum(crop) > 0
+            local_com = center_of_mass(crop)
+            global_com = (sl_x.start + local_com[1] - 1, sl_y.start + local_com[2] - 1, sl_z.start + local_com[3] - 1)
+        else
+            global_com = Float64.(idx_tup)
+        end
+        
+        c_mm = (global_com .- 0.5) .* voxel_size
+        push!(centers, c_mm)
+        
+        mask = create_sphere_mask(size(image), c_mm, 30.0, voxel_size)
+        temp[mask] .= 0.0
+    end
+    
+    sort!(centers, by = c -> sum(image[create_sphere_mask(size(image), c, 30.0, voxel_size)]))
+    
+    lx = mean([c[1] for c in centers])
+    ly = mean([c[2] for c in centers])
+    lz = mean([c[3] for c in centers])
+    return centers, (lx, ly, lz)
+end
+
+function check_and_fix_orientation(image, voxel_size, centers, lung_center)
+    coords = hcat([collect(c) for c in centers]...)'
+    stds = [std(coords[:, i]) for i in 1:3]
+    z_axis_idx = argmin(stds)
+    
+    if z_axis_idx == 2
+        image = permutedims(image, (1, 3, 2))
+        voxel_size = (voxel_size[1], voxel_size[3], voxel_size[2])
+        centers = [(c[1], c[3], c[2]) for c in centers]
+        lung_center = (lung_center[1], lung_center[3], lung_center[2])
+    elseif z_axis_idx == 1
+        image = permutedims(image, (3, 2, 1))
+        voxel_size = (voxel_size[3], voxel_size[2], voxel_size[1])
+        centers = [(c[3], c[2], c[1]) for c in centers]
+        lung_center = (lung_center[3], lung_center[2], lung_center[1])
+    end
+    
+    return image, voxel_size, centers, lung_center
+end
+
+# Run Loading & Processing
+img, v_size = load_dicom_volume(DICOM_DIR)
+centers_raw, lung_loc = auto_find_centers(img, v_size)
+img, v_size, centers_raw, lung_loc = check_and_fix_orientation(img, v_size, centers_raw, lung_loc)
+
+centers = Tuple{Float64, Float64, Float64}[]
+for (i, c) in enumerate(centers_raw)
+    off = get(MANUAL_OFFSETS_MAP, DIAMETERS[i], (0.0, 0.0, 0.0))
+    push!(centers, (c[1] + off[1], c[2] + off[2], c[3] + off[3]))
+end
+```
+
+# Geometric Verification & MIPs
+
+The following figures verify the geometric detection of spheres and their alignment in the scanner field of view. Original spheres are shown in solid red, and the 37 mm background VOIs (shifted -55 mm in Z) are shown in dashed blue in the Coronal view.
+
+```{julia}
+#| label: fig-1
+#| fig-cap: "Axial (XY) and Coronal (XZ) Maximum Intensity Projections."
+#| echo: false
+#| out-width: "65%"
+
+function plot_fig1_mips(image, voxel_size, centers, diameters, lung_center)
+    mip_z = maximum(image, dims=3)[:, :, 1]'
+    mip_y = maximum(image, dims=2)[:, 1, :]'
+    
+    x_ax = (1:size(image, 1)) .* voxel_size[1]
+    y_ax = (1:size(image, 2)) .* voxel_size[2]
+    z_ax = (1:size(image, 3)) .* voxel_size[3]
+    
+    p1 = heatmap(x_ax, y_ax, mip_z, color=cgrad(:greys, rev=true), legend=false, title="Axial (XY)", aspect_ratio=:equal, xlabel="X (mm)", ylabel="Y (mm)", xlims=(0, 600), ylims=(0, 600))
+    p2 = heatmap(x_ax, z_ax, mip_y, color=cgrad(:greys, rev=true), legend=false, title="Coronal (XZ)", aspect_ratio=:equal, xlabel="X (mm)", ylabel="Z (mm)", xlims=(0, 600), ylims=(-100, 500))
+    
+    θ = range(0, 2π, length=100)
+    for (i, c) in enumerate(centers)
+        # Original Spheres
+        r = diameters[i] / 2.0
+        plot!(p1, c[1] .+ r .* cos.(θ), c[2] .+ r .* sin.(θ), color=:red, lw=0.5)
+        plot!(p2, c[1] .+ r .* cos.(θ), c[3] .+ r .* sin.(θ), color=:red, lw=0.5)
+        
+        # New Background VOIs (37mm diameter, shifted -55mm in Z) 
+        # Displayed only on Coronal (XZ) plot
+        r_bg = 37.0 / 2.0
+        c_bg = (c[1], c[2], c[3] - 55.0)
+        plot!(p2, c_bg[1] .+ r_bg .* cos.(θ), c_bg[3] .+ r_bg .* sin.(θ), color=:blue, lw=0.5, linestyle=:dash)
+    end
+    
+    p = plot(p1, p2, layout=(1, 2), size=(1536, 768), bottom_margin=8Plots.mm, left_margin=8Plots.mm)
+    savefig(p, joinpath(sr, "fig1_$(sr).png"))
+    return p
+end
+
+plot_fig1_mips(img, v_size, centers, DIAMETERS, lung_loc)
+```
+
+### Manual Sphere Offsets
+
+\footnotesize
+
+```{julia}
+#| label: offsets-table
+#| echo: false
+#| output: asis
+
+df_offsets = DataFrame(
+    "Diameter (mm)" => DIAMETERS,
+    "Offset X (mm)" => [MANUAL_OFFSETS_MAP[d][1] for d in DIAMETERS],
+    "Offset Y (mm)" => [MANUAL_OFFSETS_MAP[d][2] for d in DIAMETERS],
+    "Offset Z (mm)" => [MANUAL_OFFSETS_MAP[d][3] for d in DIAMETERS]
+)
+
+CSV.write(joinpath(sr, "SphOff-$(sr).csv"), df_offsets)
+
+println("\n")
+println("Diameter (mm)   Offset X (mm)   Offset Y (mm)   Offset Z (mm)")
+println("-------------   -------------   -------------   -------------")
+for r in eachrow(df_offsets)
+    @printf("%-13.1f   %-13.1f   %-13.1f   %-13.1f\n", r[1], r[2], r[3], r[4])
+end
+println("\n")
+```
+
+\normalsize
+
+\newpage
+## Sphere Intensity Profiles
+
+Cross-sectional profiles through the center of selected spheres are shown below. The dashed line indicates the expected true activity concentration.
+
+```{julia}
+#| label: fig-2
+#| fig-cap: "Intensity Profiles for Spheres (Relative RC). The x-axis represents the distance from the sphere center in millimeters (mm)."
+#| echo: false
+
+function plot_fig2_profiles(image, voxel_size, centers, diameters, true_act)
+    targets = [10.0, 13.0, 17.0, 22.0, 28.0, 37.0]
+    win_mm = 40.0
+    win_px = [round(Int, win_mm / v) for v in voxel_size]
+    
+    plots_list = []
+    
+    for (i, t) in enumerate(targets)
+        idx = argmin(abs.(diameters .- t))
+        c = centers[idx]
+        r = t / 2.0
+        
+        ci = [round(Int, x / v) for (x, v) in zip(c, voxel_size)]
+        
+        h_prof = image[:, ci[2], ci[3]] ./ true_act
+        v_prof = image[ci[1], :, ci[3]] ./ true_act
+        
+        sx, ex = max(1, ci[1] - win_px[1]), min(length(h_prof), ci[1] + win_px[1])
+        sy, ey = max(1, ci[2] - win_px[2]), min(length(v_prof), ci[2] + win_px[2])
+        
+        xa_h = ((sx:ex) .- ci[1]) .* voxel_size[1]
+        xa_v = ((sy:ey) .- ci[2]) .* voxel_size[2]
+        
+        p = plot(xa_h, h_prof[sx:ex], color=:blue, label="Horiz", title="$(Int(t))mm Sphere", ylims=(0, 1.5))
+        plot!(p, xa_v, v_prof[sy:ey], color=:green, label="Vert")
+        
+        vline!(p, [-r, r], color=:red, linestyle=:dash, label="")
+        hline!(p, [1.0], color=:blue, linestyle=:dash, label="")
+        
+        push!(plots_list, p)
+    end
+    
+    p_all = plot(plots_list..., layout=(2, 3), size=(1200, 800), legend=false)
+    savefig(p_all, joinpath(sr, "fig2_$(sr).png"))
+    return p_all
+end
+
+plot_fig2_profiles(img, v_size, centers, DIAMETERS, TRUE_ACT_SPH)
+```
+
+# Recovery Coefficients
+
+The table below lists the calculated Recovery Coefficients (RC) for all spheres. Background VOI (37 mm diameter, shifted -55 mm in Z) metrics are included.
+
+\footnotesize
+
+```{julia}
+#| label: calc-stats
+#| echo: false
+#| output: asis
+
+function get_stats(image, voxel_size, centers, diameters, true_act_sph, true_act_bck)
+    valid_d, r_a50, r_max, r_peak, r_bg = Float64[], Float64[], Float64[], Float64[], Float64[]
+    sr_pixel = max(1, round(Int, 4.0 / voxel_size[1]))
+    results = []
+    
+    all_vals_bg = Float64[]
+    
+    for (i, d) in enumerate(diameters)
+        c = centers[i]
+        
+        # Original Sphere Processing
+        m_phy = create_sphere_mask(size(image), c, d / 2.0, voxel_size)
+        vals = image[m_phy]
+        isempty(vals) && continue
+        
+        act_max = maximum(vals)
+        act_mean = mean(vals)
+        vals_a50 = vals[vals .>= 0.5 * act_max]
+        act_a50 = isempty(vals_a50) ? 0.0 : mean(vals_a50)
+        
+        ci = [round(Int, x / v) for (x, v) in zip(c, voxel_size)]
+        best_peak = 0.0
+        for dz in -1:1, dy in -sr_pixel:sr_pixel, dx in -sr_pixel:sr_pixel
+            cm = ((ci[1] + dx - 0.5) * voxel_size[1], (ci[2] + dy - 0.5) * voxel_size[2], (ci[3] + dz - 0.5) * voxel_size[3])
+            m_p = create_sphere_mask(size(image), cm, 6.0, voxel_size)
+            curr = any(m_p) ? mean(image[m_p]) : 0.0
+            if curr > best_peak best_peak = curr end
+        end
+        
+        # Background VOI Processing (37mm diameter, shifted -55mm in Z)
+        c_bg = (c[1], c[2], c[3] - 55.0)
+        m_bg = create_sphere_mask(size(image), c_bg, 37.0 / 2.0, voxel_size)
+        vals_bg = image[m_bg]
+        append!(all_vals_bg, vals_bg) # Accumulate for total stats calculation
+        
+        act_bg = isempty(vals_bg) ? 0.0 : mean(vals_bg)
+        std_bg = isempty(vals_bg) ? 0.0 : std(vals_bg)
+        
+        push!(valid_d, d)
+        push!(r_a50, act_a50 / true_act_sph)
+        push!(r_max, act_max / true_act_sph)
+        push!(r_peak, best_peak / true_act_sph)
+        push!(r_bg, act_bg / true_act_bck)
+        
+        push!(results, (d, act_mean / true_act_sph, act_a50 / true_act_sph, act_max / true_act_sph, best_peak / true_act_sph, act_bg / true_act_bck, act_bg, std_bg))
+    end
+    
+    # Calculate pooled Background Total metrics
+    total_mean_bg = isempty(all_vals_bg) ? 0.0 : mean(all_vals_bg)
+    total_std_bg  = isempty(all_vals_bg) ? 0.0 : std(all_vals_bg)
+    total_snr_bg  = total_std_bg != 0 ? total_mean_bg / total_std_bg : 0.0
+    total_rc_bg   = total_mean_bg / true_act_bck
+    
+    total_bg_stats = (total_mean_bg, total_std_bg, total_snr_bg, total_rc_bg)
+    
+    return valid_d, r_a50, r_max, r_peak, r_bg, results, total_bg_stats
+end
+
+d_list, ra, rm, rp, rbg, stats_data, bg_totals = get_stats(img, v_size, centers, DIAMETERS, TRUE_ACT_SPH, TRUE_ACT_BCK)
+
+df = DataFrame(
+    "Diameter (mm)" => [x[1] for x in stats_data],
+    "RC Phy" => [round(x[2], digits=2) for x in stats_data],
+    "RC Mean" => [round(x[3], digits=2) for x in stats_data],
+    "RC Max" => [round(x[4], digits=2) for x in stats_data],
+    "RC Peak" => [round(x[5], digits=2) for x in stats_data],
+    "RC BG" => [round(x[6], digits=2) for x in stats_data]
+)
+
+CSV.write(joinpath(sr, "RecCoef-$(sr).csv"), df)
+
+println("\n")
+println("Diameter (mm)   RC Phy          RC Mean         RC Max          RC Peak         RC BG")
+println("-------------   -------------   -------------   -------------   -------------   -------------")
+for r in eachrow(df)
+    @printf("%-13.1f   %-13.2f   %-13.2f   %-13.2f   %-13.2f   %-13.2f\n", r[1], r[2], r[3], r[4], r[5], r[6])
+end
+println("\n")
+```
+
+\normalsize
+
+\newpage
+# Recovery Curves
+
+```{julia}
+#| label: fig-3
+#| fig-cap: "Recovery Coefficient curves"
+#| echo: false
+#| out-width: "90%"
+
+function plot_fig3_curves(diameters, rc_a50, rc_max, rc_peak)
+    vols = [(4/3) * π * ((d / 2) / 10)^3 for d in diameters]
+    
+    p1 = plot(vols, rc_a50, m=:circle, color=:blue, title="RC Mean", ylims=(0.2, 1.4))
+    hline!(p1, [1.0], linestyle=:dot, color=:grey)
+    
+    p2 = plot(vols, rc_max, m=:circle, color=:red, title="RC Max", ylims=(0.2, 1.4))
+    hline!(p2, [1.0], linestyle=:dot, color=:grey)
+    
+    p3 = plot(vols, rc_peak, m=:circle, color=:green, title="RC Peak", xlabel="Volume (mL)", ylims=(0.2, 1.4))
+    hline!(p3, [1.0], linestyle=:dot, color=:grey)
+    
+    p = plot(p1, p2, p3, layout=(3, 1), size=(800, 700), legend=false)
+    savefig(p, joinpath(sr, "fig3_$(sr).png"))
+    return p
+end
+
+plot_fig3_curves(d_list, ra, rm, rp)
+```
+
+\newpage
+# Calibration Factor and SNR
+
+\footnotesize
+
+```{julia}
+#| label: calib-snr
+#| echo: false
+#| output: asis
+
+# Output raw LaTeX table to guarantee exact column widths and vertical line placements
+println("```{=latex}")
+println("\\begin{center}")
+println("\\begin{tabular}{l | c c c c c c | c}")
+println("\\hline")
+println("VOI Chamber & 1 & 2 & 3 & 4 & 5 & 6 & Total \\\\")
+println("\\hline")
+
+row_mean = "Mean (kBq/mL)"
+row_std  = "STD (kBq/mL)"
+row_snr  = "SNR"
+row_rc   = "RC BG"
+
+for x in stats_data
+    mean_val = x[7]
+    std_val  = x[8]
+    snr_val  = std_val != 0 ? mean_val / std_val : 0.0
+    rc_val   = x[6]
+    
+    row_mean *= @sprintf(" & %.2f", mean_val)
+    row_std  *= @sprintf(" & %.2f", std_val)
+    row_snr  *= @sprintf(" & %.2f", snr_val)
+    row_rc   *= @sprintf(" & %.2f", rc_val)
+end
+
+# Append the Total metrics calculated in get_stats
+row_mean *= @sprintf(" & %.2f \\\\", bg_totals[1])
+row_std  *= @sprintf(" & %.2f \\\\", bg_totals[2])
+row_snr  *= @sprintf(" & %.2f \\\\", bg_totals[3])
+row_rc   *= @sprintf(" & %.2f \\\\", bg_totals[4])
+
+println(row_mean)
+println(row_std)
+println(row_snr)
+println(row_rc)
+
+println("\\hline")
+println("\\end{tabular}")
+println("\\end{center}")
+println("```")
+```
+
+\normalsize
