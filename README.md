@@ -1,13 +1,13 @@
 # jazpet
 Software for PET-CT medical image analysis and quality assurance 
 
-## NB. Use at your own risk - still quite rough..
+$\color{red}{\text{NB. Still quite rough! - Use at your own risk.}}$
 
-# JAZPET-RC: Automated NEMA/EARL PET Phantom Analysis
+## JAZPET-RC: Automated NEMA/EARL PET Phantom Analysis
 
 JAZPET-RC is a Quarto-based Julia pipeline for the automated Quality Control (QC) analysis of PET scanner data using the standard NEMA/EARL body phantom[cite: 4, 5]. This vendor-neutral toolkit directly processes uncompressed DICOM volumes to compute Recovery Coefficients (RC), Signal-to-Noise Ratios (SNR), and background variability, instantly generating a publication-ready PDF report[cite: 4, 5].
 
-## Features
+### Features
 
 * **Automated Geometric Verification:** Locates the 6 standard NEMA spheres, calculates their center-of-mass, and supports manual 3D spatial offsets[cite: 4, 5].
 * **Robust Noise Estimation:** Automatically places 6 spherical background VOIs (37 mm diameter) exactly 55 mm below the primary sphere plane in the Z-axis to ensure consistent noise sampling[cite: 4, 5].
@@ -16,13 +16,13 @@ JAZPET-RC is a Quarto-based Julia pipeline for the automated Quality Control (QC
 * **Visual QA:** Generates cross-sectional intensity profiles, volume-based recovery curves, and Coronal/Axial Maximum Intensity Projections (MIPs) displaying the original spheres and dashed-blue background VOIs[cite: 4, 5].
 * **Reproducible Reporting:** Compiles results into a LaTeX-typeset PDF report and exports raw data to CSV files[cite: 4, 5].
 
-## Prerequisites
+### Prerequisites
 
 * [Julia](https://julialang.org/downloads/) (v1.6 or higher recommended)
 * [Quarto](https://quarto.org/docs/get-started/)
 * A LaTeX distribution (e.g., TeX Live or TinyTeX) for PDF compilation.
 
-### Julia Dependencies
+#### Julia Dependencies
 The script relies on several Julia packages[cite: 5]. Install them via the Julia REPL:
 
 ```julia
@@ -30,7 +30,7 @@ using Pkg
 Pkg.add(["DICOM", "DataFrames", "Plots", "CSV", "Glob", "Statistics", "Printf"])
 ```
 
-## Setup and Configuration
+### Setup and Configuration
 
 1. **Organize DICOM Data:** 
    Place your uncompressed PET DICOM slices into a designated folder. Update the input paths in the configuration block of `jazpet_rc.qmd`[cite: 5].
@@ -55,7 +55,7 @@ Pkg.add(["DICOM", "DataFrames", "Plots", "CSV", "Glob", "Statistics", "Printf"])
    quarto render jazpet_rc.qmd --to pdf
    ```
 
-## Outputs
+### Outputs
 
 Upon execution, the toolkit generates the following files in your designated directory:
 * **`jazpet_rc.pdf`**: The clinical QC report featuring tables, MIPs, intensity profiles, and recovery curves[cite: 4, 5].
