@@ -5,6 +5,8 @@ $\color{red}{\text{NB. Still quite rough! - Use at your own risk.}}$
 
 ## JAZPET-RC: Automated NEMA/EARL PET Phantom Analysis
 
+$\color{red}{\textsf{This line will appear red and match standard text.}}$
+
 JAZPET-RC is a Quarto-based Julia pipeline for the automated Quality Control (QC) analysis of PET scanner data using the standard NEMA/EARL body phantom[cite: 4, 5]. This vendor-neutral toolkit directly processes uncompressed DICOM volumes to compute Recovery Coefficients (RC), Signal-to-Noise Ratios (SNR), and background variability, instantly generating a publication-ready PDF report[cite: 4, 5].
 
 ### Features
